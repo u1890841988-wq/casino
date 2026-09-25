@@ -1,0 +1,998 @@
+/* ==========================================================================
+   Lucky Vault — Combined Script
+   ========================================================================== */
+
+/* ---------- 1. Store ---------- */
+const STORAGE_KEY = 'lucky_vault_state_v1';
+const DEFAULTS = {
+  balance: 1000,
+  startBalance: 1000,
+  wagered: 0,
+  won: 0,
+  rounds: 0,
+  biggestWin: 0
+};
+
+let state = loadState();
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { ...DEFAULTS };
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULTS, ...parsed };
+  } catch (e) {
+    return { ...DEFAULTS };
+  }
+}
+
+function saveState() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {}
+  renderBalance();
+  renderStats();
+}
+
+function resetState() {
+  state = { ...DEFAULTS };
+  saveState();
+  toast('Bankroll reset to $1,000', 'push');
+}
+
+function addBalance(amount) {
+  state.balance += amount;
+  if (amount > 0) state.won += amount;
+  saveState();
+}
+
+function placeBet(amount) {
+  if (amount > state.balance) {
+    toast('Insufficient balance!', 'lose');
+    return false;
+  }
+  state.balance -= amount;
+  state.wagered += amount;
+  state.rounds += 1;
+  saveState();
+  return true;
+}
+
+function recordWin(amount) {
+  if (amount > state.biggestWin) state.biggestWin = amount;
+}
+
+/* ---------- 2. Utils ---------- */
+function $(sel, ctx = document) { return ctx.querySelector(sel); }
+function $$(sel, ctx = document) { return Array.from(ctx.querySelectorAll(sel)); }
+
+function fmt(n, prefix = '$') {
+  return prefix + Number(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function randomChoice(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function toast(msg, type = '') {
+  const box = $('#toasts');
+  if (!box) return;
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 320);
+  }, 2600);
+}
+
+function renderBalance() {
+  const el = $('#balance');
+  if (!el) return;
+  const newVal = fmt(state.balance);
+  if (el.textContent !== newVal) {
+    el.textContent = newVal;
+    el.classList.remove('flash-up', 'flash-down');
+    void el.offsetWidth;
+    el.classList.add(state.balance >= state.startBalance ? 'flash-up' : 'flash-down');
+  }
+}
+
+function renderStats() {
+  const set = (id, val) => {
+    const el = $(id);
+    if (el) el.textContent = val;
+  };
+  set('#st-balance', fmt(state.balance));
+  set('#st-start', fmt(state.startBalance));
+  set('#st-wagered', fmt(state.wagered));
+  set('#st-won', fmt(state.won));
+  const net = state.balance - state.startBalance;
+  const netEl = $('#st-net');
+  if (netEl) {
+    netEl.textContent = (net >= 0 ? '+' : '') + fmt(net);
+    netEl.className = net > 0 ? 'positive' : net < 0 ? 'negative' : '';
+  }
+  set('#st-rounds', state.rounds.toLocaleString());
+  set('#st-biggest', fmt(state.biggestWin));
+  const rtp = state.wagered > 0 ? ((state.won / state.wagered) * 100).toFixed(2) + '%' : '–';
+  set('#st-rtp', rtp);
+}
+
+/* ---------- 3. Slots ---------- */
+const SLOT_SYMBOLS = [
+  { s: '🍒', w: 6, pay: 2 },
+  { s: '🍋', w: 5, pay: 3 },
+  { s: '🔔', w: 4, pay: 5 },
+  { s: '💎', w: 3, pay: 10 },
+  { s: '7️⃣', w: 2, pay: 20 },
+  { s: '⭐', w: 1, pay: 50 }
+];
+
+function initSlots() {
+  const reelEls = $$('#slots-machine .reel .sym');
+  const spinBtn = $('#slots-spin');
+  const betInput = $('#slots-bet');
+  const betOut = $('#slots-bet-out');
+  const resultEl = $('#slots-result');
+  const paytable = $('#slots-paytable');
+
+  if (!spinBtn) return;
+
+  if (paytable && !paytable.dataset.built) {
+    paytable.dataset.built = '1';
+    SLOT_SYMBOLS.forEach(sym => {
+      const div = document.createElement('div');
+      div.className = 'pay';
+      div.innerHTML = `<span class="s">${sym.s}${sym.s}${sym.s}</span> <b>${sym.pay}×</b>`;
+      paytable.appendChild(div);
+    });
+  }
+
+  if (betInput) {
+    betInput.addEventListener('input', () => {
+      betOut.textContent = fmt(betInput.value);
+    });
+  }
+
+  spinBtn.addEventListener('click', () => {
+    const bet = Number(betInput.value);
+    if (bet < 1 || bet > state.balance) {
+      toast('Invalid bet or insufficient balance', 'lose');
+      return;
+    }
+
+    placeBet(bet);
+    spinBtn.disabled = true;
+    betInput.disabled = true;
+    resultEl.textContent = 'Spinning...';
+    resultEl.className = 'readout';
+
+    const reels = $$('#slots-machine .reel');
+    reels.forEach(r => { r.classList.remove('win', 'landed'); r.classList.add('spinning'); });
+
+    let ticks = 0;
+    const totalTicks = 24 + Math.floor(Math.random() * 8);
+
+    const interval = setInterval(() => {
+      ticks++;
+      reelEls.forEach(el => {
+        el.textContent = randomChoice(SLOT_SYMBOLS).s;
+      });
+
+      if (ticks >= totalTicks) {
+        clearInterval(interval);
+        finishSpin();
+      }
+    }, 60);
+
+    function finishSpin() {
+      const results = [0, 1, 2].map(() => {
+        const totalWeight = SLOT_SYMBOLS.reduce((sum, s) => sum + s.w, 0);
+        let r = Math.random() * totalWeight;
+        for (const sym of SLOT_SYMBOLS) {
+          if (r < sym.w) return sym;
+          r -= sym.w;
+        }
+        return SLOT_SYMBOLS[0];
+      });
+
+      reelEls.forEach((el, i) => {
+        el.textContent = results[i].s;
+      });
+
+      reels.forEach(r => { r.classList.remove('spinning'); r.classList.add('landed'); });
+
+      const symbols = results.map(r => r.s);
+      let win = 0;
+      let msg = '';
+      let winType = '';
+
+      if (symbols[0] === symbols[1] && symbols[1] === symbols[2]) {
+        const sym = results[0];
+        win = bet * sym.pay;
+        msg = `JACKPOT! Three ${sym.s} — won ${fmt(win)}!`;
+        winType = 'win';
+        reels.forEach(r => r.classList.add('win'));
+      } else if (symbols[0] === symbols[1] || symbols[1] === symbols[2] || symbols[0] === symbols[2]) {
+        win = bet;
+        msg = `Two of a kind — returned ${fmt(win)}.`;
+        winType = 'push';
+      } else {
+        msg = 'No match. Better luck next spin!';
+        winType = 'lose';
+      }
+
+      if (win > 0) {
+        addBalance(win);
+        recordWin(win);
+        toast(`Slots: +${fmt(win)}`, winType === 'win' ? 'win' : 'push');
+      } else {
+        toast(`Slots: -${fmt(bet)}`, 'lose');
+      }
+
+      resultEl.textContent = msg;
+      resultEl.className = 'readout ' + winType;
+
+      spinBtn.disabled = false;
+      betInput.disabled = false;
+    }
+  });
+}
+
+/* ---------- 4. Roulette ---------- */
+const RED_NUMBERS = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+
+function initRoulette() {
+  const board = $('#roulette-board');
+  const orb = $('#roulette-orb');
+  const chipTray = $('#chip-tray');
+  const totalEl = $('#roulette-total');
+  const spinBtn = $('#roulette-spin');
+  const clearBtn = $('#roulette-clear');
+  const undoBtn = $('#roulette-undo');
+  const history = $('#roulette-history');
+  const resultEl = $('#roulette-result');
+
+  if (!board) return;
+
+  let selectedChip = 5;
+  const bets = new Map();
+
+  // Build chip tray
+  if (chipTray && !chipTray.dataset.built) {
+    chipTray.dataset.built = '1';
+    [1, 5, 10, 25, 100].forEach(v => {
+      const btn = document.createElement('button');
+      btn.className = 'chip' + (v === selectedChip ? ' active' : '');
+      btn.dataset.value = v;
+      btn.textContent = '$' + v;
+      btn.addEventListener('click', () => {
+        selectedChip = v;
+        $$('.chip', chipTray).forEach(c => c.classList.remove('active'));
+        btn.classList.add('active');
+      });
+      chipTray.appendChild(btn);
+    });
+  }
+
+  // Build board
+  const layout = [];
+  layout.push({ label: '0', value: '0', cls: 'green zero', span: 1 });
+
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 12; col++) {
+      const n = col * 3 + (3 - row);
+      const isRed = RED_NUMBERS.has(n);
+      layout.push({ label: String(n), value: String(n), cls: isRed ? 'red' : 'black', span: 1 });
+    }
+  }
+
+  const outsideBets = [
+    { label: '1st 12', value: '1st12', span: 4 },
+    { label: '2nd 12', value: '2nd12', span: 4 },
+    { label: '3rd 12', value: '3rd12', span: 4 },
+    { label: '1-18', value: '1-18', span: 2 },
+    { label: 'EVEN', value: 'EVEN', span: 2 },
+    { label: 'RED', value: 'RED', span: 2, cls: 'red' },
+    { label: 'BLACK', value: 'BLACK', span: 2, cls: 'black' },
+    { label: 'ODD', value: 'ODD', span: 2 },
+    { label: '19-36', value: '19-36', span: 2 }
+  ];
+
+  layout.forEach(cell => {
+    const el = document.createElement('div');
+    el.className = 'rcell ' + cell.cls;
+    el.textContent = cell.label;
+    el.dataset.value = cell.value;
+    if (cell.span > 1) el.style.gridColumn = `span ${cell.span}`;
+    board.appendChild(el);
+  });
+
+  outsideBets.forEach(bet => {
+    const el = document.createElement('div');
+    el.className = 'rcell outside ' + (bet.cls || '');
+    el.textContent = bet.label;
+    el.dataset.value = bet.value;
+    el.style.gridColumn = `span ${bet.span}`;
+    board.appendChild(el);
+  });
+
+  function renderBets() {
+    $$('.rcell', board).forEach(el => {
+      el.classList.remove('has-chips');
+      const old = el.querySelector('.chip-stack');
+      if (old) old.remove();
+      const val = el.dataset.value;
+      if (bets.has(val)) {
+        el.classList.add('has-chips');
+        const stack = document.createElement('div');
+        stack.className = 'chip-stack';
+        stack.textContent = '$' + bets.get(val);
+        el.appendChild(stack);
+      }
+    });
+    const total = Array.from(bets.values()).reduce((a, b) => a + b, 0);
+    totalEl.textContent = fmt(total);
+  }
+
+  function placeChip(val) {
+    const current = bets.get(val) || 0;
+    if (state.balance < selectedChip) {
+      toast('Insufficient balance', 'lose');
+      return;
+    }
+    state.balance -= selectedChip;
+    state.wagered += selectedChip;
+    bets.set(val, current + selectedChip);
+    saveState();
+    renderBets();
+  }
+
+  board.addEventListener('click', e => {
+    const cell = e.target.closest('.rcell');
+    if (!cell || spinBtn.disabled) return;
+    placeChip(cell.dataset.value);
+  });
+
+  undoBtn.addEventListener('click', () => {
+    const entries = Array.from(bets.entries());
+    if (entries.length === 0) return;
+    const [key, amount] = entries[entries.length - 1];
+    state.balance += amount;
+    state.wagered -= amount;
+    bets.delete(key);
+    saveState();
+    renderBets();
+  });
+
+  clearBtn.addEventListener('click', () => {
+    let total = 0;
+    bets.forEach(v => total += v);
+    state.balance += total;
+    state.wagered -= total;
+    bets.clear();
+    saveState();
+    renderBets();
+  });
+
+  spinBtn.addEventListener('click', () => {
+    const total = Array.from(bets.values()).reduce((a, b) => a + b, 0);
+    if (total === 0) {
+      toast('Place at least one chip', 'lose');
+      return;
+    }
+
+    spinBtn.disabled = true;
+    orb.className = 'result-orb';
+    orb.textContent = '?';
+    resultEl.textContent = 'Spinning...';
+    resultEl.className = 'readout';
+
+    let ticks = 0;
+    const interval = setInterval(() => {
+      ticks++;
+      const n = randInt(0, 36);
+      orb.textContent = n;
+      orb.className = 'result-orb ' + (n === 0 ? 'green' : RED_NUMBERS.has(n) ? 'red' : 'black');
+      if (ticks > 18) {
+        clearInterval(interval);
+        resolveSpin();
+      }
+    }, 80);
+
+    function resolveSpin() {
+      const n = randInt(0, 36);
+      const isRed = RED_NUMBERS.has(n);
+      const color = n === 0 ? 'green' : isRed ? 'red' : 'black';
+
+      orb.textContent = n;
+      orb.className = 'result-orb ' + color;
+
+      let totalWin = 0;
+      bets.forEach((amount, key) => {
+        let win = 0;
+        const num = Number(key);
+        if (key === String(n)) win = amount * 36;
+        else if (key === 'RED' && isRed) win = amount * 2;
+        else if (key === 'BLACK' && !isRed && n !== 0) win = amount * 2;
+        else if (key === 'EVEN' && n !== 0 && n % 2 === 0) win = amount * 2;
+        else if (key === 'ODD' && n % 2 === 1) win = amount * 2;
+        else if (key === '1-18' && n >= 1 && n <= 18) win = amount * 2;
+        else if (key === '19-36' && n >= 19 && n <= 36) win = amount * 2;
+        else if (key === '1st12' && n >= 1 && n <= 12) win = amount * 3;
+        else if (key === '2nd12' && n >= 13 && n <= 24) win = amount * 3;
+        else if (key === '3rd12' && n >= 25 && n <= 36) win = amount * 3;
+        totalWin += win;
+      });
+
+      if (totalWin > 0) {
+        addBalance(totalWin);
+        recordWin(totalWin);
+        resultEl.textContent = `Rolled ${n} ${color.toUpperCase()} — won ${fmt(totalWin)}!`;
+        resultEl.className = 'readout win';
+        toast(`Roulette: +${fmt(totalWin)}`, 'win');
+      } else {
+        resultEl.textContent = `Rolled ${n} ${color.toUpperCase()} — no win.`;
+        resultEl.className = 'readout lose';
+        toast(`Roulette: -${fmt(total)}`, 'lose');
+      }
+
+      const h = document.createElement('div');
+      h.className = 'h ' + color;
+      h.textContent = n;
+      history.prepend(h);
+      if (history.children.length > 12) history.lastChild.remove();
+
+      bets.clear();
+      renderBets();
+      spinBtn.disabled = false;
+    }
+  });
+
+  renderBets();
+}
+
+/* ---------- 5. Blackjack ---------- */
+function initBlackjack() {
+  const dealBtn = $('#bj-deal');
+  const hitBtn = $('#bj-hit');
+  const standBtn = $('#bj-stand');
+  const doubleBtn = $('#bj-double');
+  const betInput = $('#bj-bet');
+  const playerCards = $('#bj-player-cards');
+  const dealerCards = $('#bj-dealer-cards');
+  const playerScore = $('#bj-player-score');
+  const dealerScore = $('#bj-dealer-score');
+  const resultEl = $('#bj-result');
+
+  if (!dealBtn) return;
+
+  let deck = [];
+  let playerHand = [];
+  let dealerHand = [];
+  let currentBet = 0;
+  let inRound = false;
+
+  function buildDeck() {
+    const suits = ['♠', '♥', '♦', '♣'];
+    const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+    deck = [];
+    for (let i = 0; i < 6; i++) {
+      suits.forEach(suit => {
+        ranks.forEach(rank => {
+          deck.push({ rank, suit });
+        });
+      });
+    }
+    // Shuffle
+    for (let i = deck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+  }
+
+  function cardValue(card) {
+    if (card.rank === 'A') return 11;
+    if (['J', 'Q', 'K'].includes(card.rank)) return 10;
+    return Number(card.rank);
+  }
+
+  function handValue(hand) {
+    let val = 0;
+    let aces = 0;
+    hand.forEach(c => {
+      val += cardValue(c);
+      if (c.rank === 'A') aces++;
+    });
+    while (val > 21 && aces > 0) {
+      val -= 10;
+      aces--;
+    }
+    return val;
+  }
+
+  function cardEl(card, hidden = false) {
+    const el = document.createElement('div');
+    el.className = 'card' + (hidden ? ' back hidden' : '') + (['♥', '♦'].includes(card.suit) ? ' red' : '');
+    if (hidden) return el;
+
+    el.innerHTML = `
+      <div class="corner">${card.rank}<span>${card.suit}</span></div>
+      <div class="pip">${card.suit}</div>
+      <div class="corner bottom">${card.rank}<span>${card.suit}</span></div>
+    `;
+    return el;
+  }
+
+  function renderHands(revealDealer = false) {
+    playerCards.innerHTML = '';
+    dealerCards.innerHTML = '';
+
+    dealerHand.forEach((c, i) => {
+      dealerCards.appendChild(cardEl(c, !revealDealer && i === 1));
+    });
+
+    playerHand.forEach(c => {
+      playerCards.appendChild(cardEl(c));
+    });
+
+    const pScore = handValue(playerHand);
+    const dScore = revealDealer ? handValue(dealerHand) : (dealerHand.length ? cardValue(dealerHand[0]) : 0);
+    playerScore.textContent = pScore;
+    dealerScore.textContent = revealDealer ? dScore : (dealerHand.length ? dScore + ' + ?' : '–');
+  }
+
+  function endRound(msg, type) {
+    inRound = false;
+    dealBtn.disabled = false;
+    hitBtn.disabled = true;
+    standBtn.disabled = true;
+    doubleBtn.disabled = true;
+    resultEl.textContent = msg;
+    resultEl.className = 'readout ' + type;
+  }
+
+  dealBtn.addEventListener('click', () => {
+    const bet = Number(betInput.value);
+    if (bet < 1 || bet > state.balance) {
+      toast('Invalid bet', 'lose');
+      return;
+    }
+
+    placeBet(bet);
+    currentBet = bet;
+    buildDeck();
+    playerHand = [deck.pop(), deck.pop()];
+    dealerHand = [deck.pop(), deck.pop()];
+    inRound = true;
+
+    dealBtn.disabled = true;
+    hitBtn.disabled = false;
+    standBtn.disabled = false;
+    doubleBtn.disabled = state.balance < bet;
+    resultEl.textContent = 'Your move.';
+    resultEl.className = 'readout';
+    renderHands();
+  });
+
+  hitBtn.addEventListener('click', () => {
+    if (!inRound) return;
+    playerHand.push(deck.pop());
+    renderHands();
+    if (handValue(playerHand) > 21) {
+      endRound('Bust! You went over 21.', 'lose');
+      toast(`Blackjack: -${fmt(currentBet)}`, 'lose');
+    }
+    doubleBtn.disabled = true;
+  });
+
+  standBtn.addEventListener('click', () => {
+    if (!inRound) return;
+    hitBtn.disabled = true;
+    standBtn.disabled = true;
+    doubleBtn.disabled = true;
+
+    while (handValue(dealerHand) < 17) {
+      dealerHand.push(deck.pop());
+    }
+
+    renderHands(true);
+    const p = handValue(playerHand);
+    const d = handValue(dealerHand);
+
+    if (d > 21) {
+      const win = currentBet * 2;
+      addBalance(win);
+      recordWin(win);
+      endRound(`Dealer busts with ${d}! You win ${fmt(win)}.`, 'win');
+      toast(`Blackjack: +${fmt(win)}`, 'win');
+    } else if (p > d) {
+      const win = currentBet * 2;
+      addBalance(win);
+      recordWin(win);
+      endRound(`You win! ${p} vs ${d}. +${fmt(win)}`, 'win');
+      toast(`Blackjack: +${fmt(win)}`, 'win');
+    } else if (p === d) {
+      addBalance(currentBet);
+      endRound(`Push. Both have ${p}. Bet returned.`, 'push');
+      toast(`Blackjack: Push`, 'push');
+    } else {
+      endRound(`Dealer wins ${d} vs ${p}.`, 'lose');
+      toast(`Blackjack: -${fmt(currentBet)}`, 'lose');
+    }
+  });
+
+  doubleBtn.addEventListener('click', () => {
+    if (!inRound) return;
+    if (state.balance < currentBet) return;
+    placeBet(currentBet);
+    currentBet *= 2;
+    playerHand.push(deck.pop());
+    renderHands();
+    if (handValue(playerHand) > 21) {
+      endRound('Bust on double!', 'lose');
+      toast(`Blackjack: -${fmt(currentBet)}`, 'lose');
+      return;
+    }
+    standBtn.click();
+  });
+}
+
+/* ---------- 6. Dice ---------- */
+function initDice() {
+  const rollBtn = $('#dice-roll');
+  const targetSlider = $('#dice-target');
+  const betSlider = $('#dice-bet');
+  const betOut = $('#dice-bet-out');
+  const modeToggle = $('#dice-mode');
+  const numberEl = $('#dice-number');
+  const winBar = $('#dice-win');
+  const needle = $('#dice-needle');
+  const hit = $('#dice-hit');
+  const chanceEl = $('#dice-chance');
+  const payoutEl = $('#dice-payout');
+  const profitEl = $('#dice-profit');
+  const resultEl = $('#dice-result');
+
+  if (!rollBtn) return;
+
+  let mode = 'under';
+
+  function updateUI() {
+    const target = Number(targetSlider.value);
+    const bet = Number(betSlider.value);
+    betOut.textContent = fmt(bet);
+
+    let chance, payout;
+    if (mode === 'under') {
+      chance = (target - 1) / 100;
+      payout = 0.99 / chance;
+      winBar.style.left = '0%';
+      winBar.style.width = (target - 1) + '%';
+      needle.style.left = (target - 1) + '%';
+    } else {
+      chance = (100 - target) / 100;
+      payout = 0.99 / chance;
+      winBar.style.left = target + '%';
+      winBar.style.width = (99 - target) + '%';
+      needle.style.left = target + '%';
+    }
+
+    chanceEl.textContent = (chance * 100).toFixed(2) + '%';
+    payoutEl.textContent = payout.toFixed(2) + '×';
+    profitEl.textContent = fmt(bet * (payout - 1));
+  }
+
+  targetSlider.addEventListener('input', updateUI);
+  betSlider.addEventListener('input', updateUI);
+
+  modeToggle.addEventListener('click', e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    mode = btn.dataset.mode;
+    $$('button', modeToggle).forEach(b => b.classList.toggle('active', b === btn));
+    updateUI();
+  });
+
+  rollBtn.addEventListener('click', () => {
+    const target = Number(targetSlider.value);
+    const bet = Number(betSlider.value);
+    if (bet < 1 || bet > state.balance) {
+      toast('Invalid bet', 'lose');
+      return;
+    }
+
+    placeBet(bet);
+    rollBtn.disabled = true;
+
+    const roll = Math.random() * 100;
+    numberEl.textContent = roll.toFixed(2);
+    numberEl.className = 'dice-number';
+    hit.classList.remove('show');
+    resultEl.textContent = 'Rolling...';
+    resultEl.className = 'readout';
+
+    hit.style.left = roll + '%';
+    hit.classList.add('show');
+
+    setTimeout(() => {
+      let win = false;
+      if (mode === 'under' && roll < target) win = true;
+      if (mode === 'over' && roll > target) win = true;
+
+      let chance = mode === 'under' ? (target - 1) / 100 : (100 - target) / 100;
+      let payout = 0.99 / chance;
+
+      if (win) {
+        const amount = bet * payout;
+        addBalance(amount);
+        recordWin(amount);
+        numberEl.className = 'dice-number win';
+        resultEl.textContent = `Rolled ${roll.toFixed(2)} — WIN ${fmt(amount)}!`;
+        resultEl.className = 'readout win';
+        toast(`Dice: +${fmt(amount)}`, 'win');
+      } else {
+        numberEl.className = 'dice-number lose';
+        resultEl.textContent = `Rolled ${roll.toFixed(2)} — no win.`;
+        resultEl.className = 'readout lose';
+        toast(`Dice: -${fmt(bet)}`, 'lose');
+      }
+
+      rollBtn.disabled = false;
+    }, 900);
+  });
+
+  updateUI();
+}
+
+/* ---------- 7. Plinko ---------- */
+function initPlinko() {
+  const canvas = $('#plinko-canvas');
+  if (!canvas) return;
+
+  const ctx = canvas.getContext('2d');
+  const dropBtn = $('#plinko-drop');
+  const betSlider = $('#plinko-bet');
+  const betOut = $('#plinko-bet-out');
+  const riskToggle = $('#plinko-risk');
+  const resultEl = $('#plinko-result');
+
+  const MULTIPLIERS = {
+    low: [1.5, 1.2, 1.1, 1.0, 0.9, 0.7, 0.4, 0.7, 0.9, 1.0, 1.1, 1.2, 1.5],
+    medium: [3.0, 1.8, 1.2, 0.8, 0.5, 0.3, 0.2, 0.3, 0.5, 0.8, 1.2, 1.8, 3.0],
+    high: [10.0, 4.0, 1.5, 0.5, 0.2, 0.1, 0.05, 0.1, 0.2, 0.5, 1.5, 4.0, 10.0]
+  };
+
+  let risk = 'low';
+  let balls = [];
+  let animationId = null;
+
+  function resize() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    const size = Math.min(rect.width, 620);
+    canvas.width = size;
+    canvas.height = size * 1.1;
+    drawBoard();
+  }
+
+  window.addEventListener('resize', resize);
+
+  function drawBoard() {
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // Draw pins
+    const rows = 12;
+    const cols = 13;
+    const padX = w / (cols + 1);
+    const padY = (h * 0.75) / (rows + 1);
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c <= r; c++) {
+        const x = w / 2 + (c - r / 2) * padX;
+        const y = 50 + r * padY;
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Draw multiplier slots at bottom
+    const mults = MULTIPLIERS[risk];
+    const slotW = w / mults.length;
+    for (let i = 0; i < mults.length; i++) {
+      const x = i * slotW;
+      const y = h - 40;
+      const m = mults[i];
+      const hue = m >= 1.5 ? 140 : m >= 1 ? 60 : 0;
+      ctx.fillStyle = `hsl(${hue}, 70%, 40%)`;
+      ctx.fillRect(x + 2, y, slotW - 4, 32);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(m + '×', x + slotW / 2, y + 16);
+    }
+
+    // Draw balls
+    balls.forEach(b => {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 7, 0, Math.PI * 2);
+      const grad = ctx.createRadialGradient(b.x - 2, b.y - 2, 1, b.x, b.y, 7);
+      grad.addColorStop(0, '#fff');
+      grad.addColorStop(1, b.color);
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.shadowColor = b.color;
+      ctx.shadowBlur = 12;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+  }
+
+  function animate() {
+    const w = canvas.width;
+    const h = canvas.height;
+    const rows = 12;
+    const padX = w / 14;
+    const padY = (h * 0.75) / (rows + 1);
+
+    let allDone = true;
+    balls.forEach(b => {
+      if (b.done) return;
+      allDone = false;
+
+      b.vy += 0.15;
+      b.y += b.vy;
+      b.x += b.vx;
+
+      // Bounce off pins (simple collision)
+      const nearestRow = Math.round((b.y - 50) / padY);
+      if (nearestRow >= 0 && nearestRow < rows) {
+        const rowY = 50 + nearestRow * padY;
+        if (Math.abs(b.y - rowY) < 6) {
+          b.vx += (Math.random() - 0.5) * 1.5;
+          b.vx = Math.max(-2.5, Math.min(2.5, b.vx));
+        }
+      }
+
+      // Bounce off walls
+      if (b.x < 10) { b.x = 10; b.vx = Math.abs(b.vx); }
+      if (b.x > w - 10) { b.x = w - 10; b.vx = -Math.abs(b.vx); }
+
+      // Land in slot
+      if (b.y >= h - 48) {
+        b.done = true;
+        b.y = h - 48;
+        const slotW = w / MULTIPLIERS[risk].length;
+        const slotIndex = Math.min(MULTIPLIERS[risk].length - 1, Math.max(0, Math.floor(b.x / slotW)));
+        const mult = MULTIPLIERS[risk][slotIndex];
+        const amount = b.bet * mult;
+        b.finalMult = mult;
+        b.finalAmount = amount;
+
+        if (mult > 1) {
+          addBalance(amount);
+          recordWin(amount);
+          toast(`Plinko: +${fmt(amount)}`, 'win');
+          resultEl.textContent = `Landed on ${mult}× — won ${fmt(amount)}!`;
+          resultEl.className = 'readout win';
+        } else if (mult === 1) {
+          addBalance(amount);
+          resultEl.textContent = `Landed on 1× — returned ${fmt(amount)}.`;
+          resultEl.className = 'readout push';
+          toast(`Plinko: Push`, 'push');
+        } else {
+          resultEl.textContent = `Landed on ${mult}× — lost ${fmt(b.bet)}.`;
+          resultEl.className = 'readout lose';
+          toast(`Plinko: -${fmt(b.bet)}`, 'lose');
+        }
+      }
+    });
+
+    drawBoard();
+
+    if (allDone && balls.length > 0) {
+      // Keep finished balls for a moment then clear
+      setTimeout(() => {
+        balls = balls.filter(b => !b.done);
+        drawBoard();
+      }, 1500);
+    }
+
+    animationId = requestAnimationFrame(animate);
+  }
+
+  riskToggle.addEventListener('click', e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    risk = btn.dataset.risk;
+    $$('button', riskToggle).forEach(b => b.classList.toggle('active', b === btn));
+    drawBoard();
+  });
+
+  betSlider.addEventListener('input', () => {
+    betOut.textContent = fmt(betSlider.value);
+  });
+
+  dropBtn.addEventListener('click', () => {
+    const bet = Number(betSlider.value);
+    if (bet < 1 || bet > state.balance) {
+      toast('Invalid bet', 'lose');
+      return;
+    }
+
+    placeBet(bet);
+    const w = canvas.width;
+    balls.push({
+      x: w / 2,
+      y: 30,
+      vx: (Math.random() - 0.5) * 1.5,
+      vy: 0,
+      color: risk === 'high' ? '#ff4b5b' : risk === 'medium' ? '#f5c451' : '#2fd07a',
+      bet: bet,
+      done: false
+    });
+
+    if (!animationId) {
+      animate();
+    }
+  });
+
+  resize();
+}
+
+/* ---------- 8. App Initialization ---------- */
+document.addEventListener('DOMContentLoaded', () => {
+  // Tab switching
+  const tabs = $$('.tab');
+  const panels = $$('.panel');
+
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      const game = tab.dataset.game;
+      tabs.forEach(t => t.classList.toggle('active', t === tab));
+      panels.forEach(p => p.classList.toggle('active', p.id === `panel-${game}`));
+    });
+  });
+
+  // Reset button
+  const resetBtn = $('#btn-reset');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      if (confirm('Reset your bankroll to $1,000? All stats will be cleared.')) {
+        resetState();
+        location.reload();
+      }
+    });
+  }
+
+  const stResetBtn = $('#st-reset');
+  if (stResetBtn) {
+    stResetBtn.addEventListener('click', () => {
+      if (confirm('Reset your bankroll to $1,000? All stats will be cleared.')) {
+        resetState();
+        location.reload();
+      }
+    });
+  }
+
+  // Initialize all games
+  initSlots();
+  initRoulette();
+  initBlackjack();
+  initDice();
+  initPlinko();
+
+  // Initial render
+  renderBalance();
+  renderStats();
+});
