@@ -1,291 +1,251 @@
-// server.js — WebSocket-Server für Lucky Vault Online-Duell
+// server.js — Lucky Vault HTTP-Server (keine Abhängigkeiten!)
+// Start:   node server.js
+// Dann im Browser öffnen:  http://localhost:8080
 
-const WebSocket = require("ws");
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT) || 8080;
-const HOST = process.env.HOST || "0.0.0.0";
+const PORT = process.env.PORT || 8080;
 
-const wss = new WebSocket.Server({
-  host: HOST,
-  port: PORT
-});
+/* ---------- In-Memory-Daten ---------- */
+const users = new Map();          // name -> { password, token }
+const sessions = new Map();       // token -> name
+const queue = [];                 // [{ name }]
+const rooms = new Map();          // roomId -> room
 
-console.log(`Lucky Vault Server läuft auf ${HOST}:${PORT}`);
-
-let waiting = null;
-// { ws, name, id }
-
-const rooms = new Map();
-// roomId -> { a, b, bets, rolls }
-
-let idCounter = 1;
-
-function newId() {
-  return "p" + idCounter++;
+function newToken() { return crypto.randomBytes(16).toString('hex'); }
+function newRoomId() {
+  return 'r' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
 }
-
-function send(ws, data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(JSON.stringify(data));
-    } catch (err) {
-      console.error("Sendefehler:", err.message);
-    }
+function findRoomByName(name) {
+  for (const [id, r] of rooms) {
+    if (r.a.name === name) return { id, side: 'a', room: r };
+    if (r.b.name === name) return { id, side: 'b', room: r };
   }
+  return null;
 }
 
-wss.on("connection", (ws) => {
-  ws.id = newId();
-  ws.roomId = null;
-  ws.side = null;
-
-  console.log(`Spieler verbunden: ${ws.id}`);
-
-  send(ws, {
-    type: "hello",
-    id: ws.id
+/* ---------- HTTP Helfer ---------- */
+function sendJSON(res, code, data) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data));
+}
+function readBody(req) {
+  return new Promise(resolve => {
+    let b = '';
+    req.on('data', c => { b += c; if (b.length > 1e6) req.destroy(); });
+    req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch { resolve({}); } });
   });
+}
 
-  ws.on("message", (raw) => {
-    let m;
+/* ---------- API Handler ---------- */
+function apiLogin(req, res, body) {
+  const name = String(body.name || '').trim().slice(0, 16);
+  const password = String(body.password || '').slice(0, 64);
 
-    try {
-      m = JSON.parse(raw.toString());
-    } catch (err) {
-      return;
-    }
+  if (name.length < 2) return sendJSON(res, 400, { error: 'Name zu kurz (min. 2)' });
+  if (password.length < 3) return sendJSON(res, 400, { error: 'Passwort zu kurz (min. 3)' });
 
-    // Spieler möchte der Warteschlange beitreten
-    if (m.type === "queue") {
-      if (ws.roomId) return;
+  const existing = users.get(name);
+  if (existing) {
+    if (existing.password !== password) return sendJSON(res, 401, { error: 'Falsches Passwort' });
+    const token = newToken();
+    sessions.set(token, name);
+    existing.token = token;
+    return sendJSON(res, 200, { token, name });
+  }
+  const token = newToken();
+  users.set(name, { password, token });
+  sessions.set(token, name);
+  return sendJSON(res, 200, { token, name });
+}
 
-      const name = String(m.name || "Spieler")
-        .trim()
-        .slice(0, 16) || "Spieler";
+function apiQueue(req, res, body) {
+  const name = sessions.get(body.token);
+  if (!name) return sendJSON(res, 401, { error: 'Nicht angemeldet' });
 
-      if (!waiting) {
-        waiting = {
-          ws,
-          name,
-          id: ws.id
-        };
-
-        send(ws, {
-          type: "queued",
-          info: "Warte auf Gegner…"
-        });
-
-        console.log(`${name} wartet auf einen Gegner.`);
-      } else if (waiting.ws === ws) {
-        // Spieler ist bereits in der Warteschlange.
-        return;
-      } else {
-        // Match erstellen
-        const roomId =
-          "r" +
-          Date.now().toString(36) +
-          Math.random().toString(36).slice(2, 6);
-
-        const a = waiting;
-
-        const b = {
-          ws,
-          name,
-          id: ws.id
-        };
-
-        waiting = null;
-
-        rooms.set(roomId, {
-          a,
-          b,
-          bets: {
-            a: null,
-            b: null
-          },
-          rolls: {
-            a: null,
-            b: null
-          }
-        });
-
-        a.ws.roomId = roomId;
-        a.ws.side = "a";
-
-        b.ws.roomId = roomId;
-        b.ws.side = "b";
-
-        send(a.ws, {
-          type: "matched",
-          roomId,
-          side: "a",
-          you: a.name,
-          opponent: b.name
-        });
-
-        send(b.ws, {
-          type: "matched",
-          roomId,
-          side: "b",
-          you: b.name,
-          opponent: a.name
-        });
-
-        console.log(
-          `Match erstellt: ${a.name} vs. ${b.name} (${roomId})`
-        );
-      }
-
-      return;
-    }
-
-    const roomId = ws.roomId;
-
-    if (!roomId) return;
-
-    const room = rooms.get(roomId);
-
-    if (!room) return;
-
-    const side = ws.side;
-    const otherSide = side === "a" ? "b" : "a";
-    const other = room[otherSide];
-
-    // Einsatz
-    if (m.type === "bet") {
-      const amount = Math.max(
-        1,
-        Math.min(
-          10000,
-          Math.floor(Number(m.amount) || 0)
-        )
-      );
-
-      room.bets[side] = amount;
-
-      send(other.ws, {
-        type: "opBet",
-        amount
-      });
-
-      // Beide haben gesetzt -> Runde auswerten
-      if (
-        room.bets.a !== null &&
-        room.bets.b !== null
-      ) {
-        const rollA = Math.random() * 100;
-        const rollB = Math.random() * 100;
-
-        let winnerA;
-
-        if (rollA > rollB) {
-          winnerA = "you";
-        } else if (rollA < rollB) {
-          winnerA = "opp";
-        } else {
-          winnerA = "tie";
-        }
-
-        send(room.a.ws, {
-          type: "roll",
-          you: rollA,
-          opp: rollB,
-          winner: winnerA
-        });
-
-        send(room.b.ws, {
-          type: "roll",
-          you: rollB,
-          opp: rollA,
-          winner:
-            winnerA === "you"
-              ? "opp"
-              : winnerA === "opp"
-                ? "you"
-                : "tie"
-        });
-
-        // Einsätze für nächste Runde zurücksetzen
-        room.bets.a = null;
-        room.bets.b = null;
-
-        console.log(
-          `Runde ${roomId}: ${rollA.toFixed(2)} vs ${rollB.toFixed(2)}`
-        );
-      }
-
-      return;
-    }
-
-    // Spieler verlässt das Match
-    if (m.type === "leave") {
-      cleanupRoom(roomId, ws);
-      return;
-    }
-  });
-
-  ws.on("close", () => {
-    console.log(`Spieler getrennt: ${ws.id}`);
-
-    if (waiting && waiting.ws === ws) {
-      waiting = null;
-    }
-
-    if (ws.roomId) {
-      cleanupRoom(ws.roomId, ws);
-    }
-  });
-
-  ws.on("error", (err) => {
-    console.error(`WebSocket-Fehler bei ${ws.id}:`, err.message);
-  });
-});
-
-function cleanupRoom(roomId, leaver) {
-  const room = rooms.get(roomId);
-
-  if (!room) return;
-
-  rooms.delete(roomId);
-
-  const other =
-    leaver === room.a.ws
-      ? room.b
-      : room.a;
-
-  if (
-    other &&
-    other.ws &&
-    other.ws.readyState === WebSocket.OPEN
-  ) {
-    send(other.ws, {
-      type: "oppLeft"
+  // Schon in einem Raum?
+  const existing = findRoomByName(name);
+  if (existing) {
+    const other = existing.room[existing.side === 'a' ? 'b' : 'a'];
+    return sendJSON(res, 200, {
+      state: 'matched',
+      roomId: existing.id,
+      side: existing.side,
+      opponent: other.name
     });
   }
 
-  if (room.a && room.a.ws) {
-    room.a.ws.roomId = null;
-    room.a.ws.side = null;
+  // Schon in Warteschlange?
+  if (queue.find(q => q.name === name)) return sendJSON(res, 200, { state: 'queued' });
+
+  // Gegner suchen
+  let opponent = null;
+  while (queue.length > 0) {
+    const cand = queue.shift();
+    if (cand.name !== name && sessions.has(users.get(cand.name)?.token)) {
+      opponent = cand;
+      break;
+    }
   }
 
-  if (room.b && room.b.ws) {
-    room.b.ws.roomId = null;
-    room.b.ws.side = null;
+  if (!opponent) {
+    queue.push({ name });
+    return sendJSON(res, 200, { state: 'queued' });
   }
 
-  console.log(`Raum geschlossen: ${roomId}`);
+  const roomId = newRoomId();
+  rooms.set(roomId, {
+    a: { name: opponent.name },
+    b: { name },
+    bets: { a: null, b: null },
+    result: null,
+    resultDelivered: { a: false, b: false }
+  });
+  return sendJSON(res, 200, {
+    state: 'matched',
+    roomId, side: 'b', opponent: opponent.name
+  });
 }
 
-wss.on("listening", () => {
-  const address = wss.address();
+function apiPoll(req, res, body) {
+  const name = sessions.get(body.token);
+  if (!name) return sendJSON(res, 401, { error: 'Nicht angemeldet' });
 
-  if (address && typeof address === "object") {
-    console.log(
-      `WebSocket-Server hört auf ${address.address}:${address.port}`
-    );
+  const found = findRoomByName(name);
+  if (found) {
+    const { id: roomId, side, room } = found;
+    const otherSide = side === 'a' ? 'b' : 'a';
+    const other = room[otherSide];
+    const myBet = room.bets[side];
+    const opBet = room.bets[otherSide];
+
+    if (room.result) {
+      const you   = side === 'a' ? room.result.rollA : room.result.rollB;
+      const opp   = side === 'a' ? room.result.rollB : room.result.rollA;
+      const winner = room.result.winnerA === side ? 'you'
+                   : room.result.winnerA === otherSide ? 'opp'
+                   : 'tie';
+
+      if (!room.resultDelivered[side]) {
+        room.resultDelivered[side] = true;
+        // Wenn beide das Ergebnis gesehen haben → Raum für neue Runde zurücksetzen
+        if (room.resultDelivered.a && room.resultDelivered.b) {
+          room.result = null;
+          room.resultDelivered = { a: false, b: false };
+          room.bets = { a: null, b: null };
+        }
+        return sendJSON(res, 200, {
+          state: 'result', you, opp, winner,
+          opponent: other.name
+        });
+      }
+    }
+
+    return sendJSON(res, 200, {
+      state: 'matched',
+      roomId, side,
+      opponent: other.name,
+      myBet, opBet
+    });
   }
+
+  if (queue.find(q => q.name === name)) return sendJSON(res, 200, { state: 'queued' });
+  return sendJSON(res, 200, { state: 'idle' });
+}
+
+function apiBet(req, res, body) {
+  const name = sessions.get(body.token);
+  if (!name) return sendJSON(res, 401, { error: 'Nicht angemeldet' });
+
+  const found = findRoomByName(name);
+  if (!found) return sendJSON(res, 404, { error: 'Kein Raum' });
+
+  const { side, room } = found;
+  const amount = Math.max(1, Math.min(10000, Math.floor(Number(body.amount) || 0)));
+  room.bets[side] = amount;
+
+  // Beide haben gesetzt → würfeln
+  if (room.bets.a !== null && room.bets.b !== null && !room.result) {
+    const rollA = Math.round(Math.random() * 10000) / 100;
+    const rollB = Math.round(Math.random() * 10000) / 100;
+    let winnerA;
+    if (rollA > rollB) winnerA = 'a';
+    else if (rollA < rollB) winnerA = 'b';
+    else winnerA = 'tie';
+    room.result = { rollA, rollB, winnerA };
+  }
+
+  return sendJSON(res, 200, { ok: true });
+}
+
+function apiLeave(req, res, body) {
+  const name = sessions.get(body.token);
+  if (!name) return sendJSON(res, 401, { error: 'Nicht angemeldet' });
+
+  const qi = queue.findIndex(q => q.name === name);
+  if (qi >= 0) queue.splice(qi, 1);
+
+  const found = findRoomByName(name);
+  if (found) rooms.delete(found.id);
+
+  return sendJSON(res, 200, { ok: true });
+}
+
+/* ---------- Statische Dateien ausliefern ---------- */
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css':  'text/css; charset=utf-8',
+  '.js':   'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png':  'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.svg':  'image/svg+xml', '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json'
+};
+
+function serveStatic(req, res) {
+  let p = decodeURIComponent(req.url.split('?')[0]);
+  if (p === '/') p = '/index.html';
+  const filePath = path.join(__dirname, p);
+  // Sicherheitscheck: Datei muss im Projektordner liegen
+  if (!filePath.startsWith(__dirname)) return sendJSON(res, 403, { error: 'Forbidden' });
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) return sendJSON(res, 404, { error: 'Nicht gefunden' });
+    const ext = path.extname(filePath).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    res.end(data);
+  });
+}
+
+/* ---------- Hauptserver ---------- */
+const server = http.createServer(async (req, res) => {
+  const p = req.url.split('?')[0];
+
+  if (p.startsWith('/api/')) {
+    const body = (req.method === 'POST') ? await readBody(req) : {};
+    try {
+      if (p === '/api/login') return apiLogin(req, res, body);
+      if (p === '/api/queue') return apiQueue(req, res, body);
+      if (p === '/api/poll')  return apiPoll(req, res, body);
+      if (p === '/api/bet')   return apiBet(req, res, body);
+      if (p === '/api/leave') return apiLeave(req, res, body);
+      return sendJSON(res, 404, { error: 'Unbekannter Endpunkt' });
+    } catch (e) {
+      console.error(e);
+      return sendJSON(res, 500, { error: 'Serverfehler' });
+    }
+  }
+
+  if (req.method === 'GET') return serveStatic(req, res);
+  sendJSON(res, 405, { error: 'Method not allowed' });
 });
 
-wss.on("error", (err) => {
-  console.error("Serverfehler:", err);
+server.listen(PORT, () => {
+  console.log('═══════════════════════════════════════════════════');
+  console.log('  Lucky Vault läuft auf:  http://localhost:' + PORT);
+  console.log('  Einfach im Browser öffnen. Kein npm install.');
+  console.log('═══════════════════════════════════════════════════');
 });
